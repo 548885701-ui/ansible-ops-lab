@@ -1,0 +1,110 @@
+---
+- name: 部署 Node Exporter
+  hosts: "{{ exporter_hosts | default('monitor-server') }}"
+  gather_facts: false
+  vars:
+    exporter_listen: "{{ '127.0.0.1' if inventory_hostname == 'monitor-server' else ansible_host }}"
+    exporter_sha256: b51d8a76aa2a9156a55d501aca6276fae09e262259a5e4e831d2c2222f084e63
+    exporter_version: '1.12.1'
+    exporter_release: "node_exporter-{{ exporter_version }}.linux-amd64"
+    exporter_archive: "/var/cache/{{ exporter_release }}.tar.gz"
+    exporter_binary: "/opt/{{ exporter_release }}/node_exporter"
+
+  tasks:
+    - name: 安装解压依赖
+      become: true
+      ansible.builtin.dnf:
+        name: [tar, gzip]
+        state: present
+
+    - name: 创建专用运行账号
+      become: true
+      ansible.builtin.user:
+        name: node_exporter
+        system: true
+        create_home: false
+        shell: /sbin/nologin
+
+    - name: 下载官方压缩包并校验 SHA-256
+      become: true
+      when: not (exporter_use_cache | default(false) | bool)
+      ansible.builtin.get_url:
+        url: "https://github.com/prometheus/node_exporter/releases/download/v{{ exporter_version }}/{{ exporter_release }}.tar.gz"
+        dest: "{{ exporter_archive }}"
+        checksum: "sha256:{{ exporter_sha256 }}"
+        mode: '0644'
+        timeout: 60
+
+    - name: 分发控制节点已校验的安装包
+      become: true
+      when: exporter_use_cache | default(false) | bool
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/.cache/{{ exporter_release }}.tar.gz"
+        dest: "{{ exporter_archive }}"
+        owner: root
+        group: root
+        mode: '0644'
+
+    - name: 核对目标节点上的安装包校验值
+      ansible.builtin.stat:
+        path: "{{ exporter_archive }}"
+        checksum_algorithm: sha256
+      register: exporter_archive_stat
+      failed_when: (exporter_archive_stat.stat.checksum | default('')) != exporter_sha256
+
+    - name: 解压 Node Exporter
+      become: true
+      ansible.builtin.unarchive:
+        src: "{{ exporter_archive }}"
+        dest: /opt
+        remote_src: true
+        creates: "{{ exporter_binary }}"
+        owner: root
+        group: root
+
+    - name: 写入 systemd 服务
+      become: true
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/node_exporter.service
+        owner: root
+        group: root
+        mode: '0644'
+        content: |
+          [Unit]
+          Description=Prometheus Node Exporter
+
+          [Service]
+          User=node_exporter
+          ExecStart={{ exporter_binary }} --web.listen-address={{ exporter_listen }}:9100
+          Restart=on-failure
+
+          [Install]
+          WantedBy=multi-user.target
+      register: exporter_unit
+
+    - name: 启动并设置开机自启
+      become: true
+      ansible.builtin.systemd:
+        name: node_exporter
+        daemon_reload: true
+        state: "{{ 'restarted' if exporter_unit.changed else 'started' }}"
+        enabled: true
+
+    - name: 验证本机指标端点
+      ansible.builtin.uri:
+        url: "http://{{ exporter_listen }}:9100/metrics"
+        use_proxy: false
+        status_code: 200
+        return_content: true
+      register: exporter_metrics
+      until: exporter_metrics.status | default(0) == 200
+      retries: 5
+      delay: 2
+
+    - name: 核对 CPU 内存和磁盘指标
+      ansible.builtin.assert:
+        that:
+          - "'node_cpu_seconds_total' in exporter_metrics.content"
+          - "'node_memory_MemAvailable_bytes' in exporter_metrics.content"
+          - "'node_filesystem_avail_bytes' in exporter_metrics.content"
+        success_msg: CPU、内存和磁盘指标均已返回

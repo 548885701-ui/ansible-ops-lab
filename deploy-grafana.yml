@@ -1,0 +1,275 @@
+---
+- name: 部署 Grafana 和 Linux 巡检仪表盘
+  hosts: monitor-server
+  gather_facts: false
+  become: true
+  vars:
+    grafana_rule: 'rule family="ipv4" source address="192.168.175.0/24" port port="3000" protocol="tcp" accept'
+
+  tasks:
+    - name: 安装 Rocky AppStream 提供的 Grafana
+      ansible.builtin.dnf:
+        name: grafana
+        state: present
+        disablerepo: epel
+
+    - name: 检查 Grafana 连接 Prometheus 的 SELinux 开关
+      ansible.builtin.command: getsebool grafana_can_tcp_connect_prometheus_port
+      register: grafana_prometheus_boolean
+      changed_when: false
+
+    - name: 持久启用 Grafana 的 Prometheus 连接权限
+      ansible.builtin.command: setsebool -P grafana_can_tcp_connect_prometheus_port on
+      when: grafana_prometheus_boolean.stdout.endswith('off')
+
+    - name: 生成仅 root 可读的初始管理员密码
+      ansible.builtin.shell: |
+        umask 077
+        password=$(openssl rand -hex 24) || exit
+        printf 'GF_SECURITY_ADMIN_PASSWORD=%s\n' "$password" > /etc/grafana/ops-lab-admin.env
+      args:
+        creates: /etc/grafana/ops-lab-admin.env
+      no_log: true
+
+    - name: 创建服务覆盖配置和仪表盘目录
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: '0755'
+      loop:
+        - /etc/systemd/system/grafana-server.service.d
+        - /var/lib/grafana/ops-lab-dashboards
+
+    - name: 配置实验网卡上的 TCP 3000
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/grafana-server.service.d/ops-lab.conf
+        mode: '0644'
+        content: |
+          [Service]
+          Environment=GF_SERVER_HTTP_ADDR=192.168.175.13
+          Environment=GF_SERVER_HTTP_PORT=3000
+          EnvironmentFile=/etc/grafana/ops-lab-admin.env
+      notify: 重启 Grafana
+
+    - name: 配置 Prometheus 数据源
+      ansible.builtin.copy:
+        dest: /etc/grafana/provisioning/datasources/ops-lab.yml
+        mode: '0644'
+        content: |
+          apiVersion: 1
+          datasources:
+            - name: Prometheus
+              uid: ops-prometheus
+              type: prometheus
+              access: proxy
+              url: http://127.0.0.1:9090
+              isDefault: true
+      notify: 重启 Grafana
+
+    - name: 告诉 Grafana 从哪里加载仪表盘
+      ansible.builtin.copy:
+        dest: /etc/grafana/provisioning/dashboards/ops-lab.yml
+        mode: '0644'
+        content: |
+          apiVersion: 1
+          providers:
+            - name: ops-lab
+              type: file
+              options:
+                path: /var/lib/grafana/ops-lab-dashboards
+      notify: 重启 Grafana
+
+    - name: 写入在线状态和资源使用率面板
+      ansible.builtin.copy:
+        dest: /var/lib/grafana/ops-lab-dashboards/linux.json
+        mode: '0644'
+        content: |
+          {
+            "uid": "ops-linux-lab",
+            "title": "Linux 运维实验监控",
+            "schemaVersion": 38,
+            "refresh": "15s",
+            "time": {
+              "from": "now-15m",
+              "to": "now"
+            },
+            "panels": [
+              {
+                "id": 1,
+                "title": "节点在线",
+                "type": "timeseries",
+                "gridPos": {
+                  "x": 0,
+                  "y": 0,
+                  "w": 12,
+                  "h": 9
+                },
+                "datasource": {
+                  "type": "prometheus",
+                  "uid": "ops-prometheus"
+                },
+                "fieldConfig": {
+                  "defaults": {
+                    "unit": "short"
+                  },
+                  "overrides": []
+                },
+                "targets": [
+                  {
+                    "refId": "A",
+                    "expr": "up{job=\"linux\"}",
+                    "legendFormat": "{% raw %}{{node}}{% endraw %}",
+                    "datasource": {
+                      "type": "prometheus",
+                      "uid": "ops-prometheus"
+                    }
+                  }
+                ]
+              },
+              {
+                "id": 2,
+                "title": "CPU 使用率",
+                "type": "timeseries",
+                "gridPos": {
+                  "x": 12,
+                  "y": 0,
+                  "w": 12,
+                  "h": 9
+                },
+                "datasource": {
+                  "type": "prometheus",
+                  "uid": "ops-prometheus"
+                },
+                "fieldConfig": {
+                  "defaults": {
+                    "unit": "percent"
+                  },
+                  "overrides": []
+                },
+                "targets": [
+                  {
+                    "refId": "A",
+                    "expr": "100 * (1 - avg by (node) (rate(node_cpu_seconds_total{mode=\"idle\"}[2m])))",
+                    "legendFormat": "{% raw %}{{node}}{% endraw %}",
+                    "datasource": {
+                      "type": "prometheus",
+                      "uid": "ops-prometheus"
+                    }
+                  }
+                ]
+              },
+              {
+                "id": 3,
+                "title": "内存使用率",
+                "type": "timeseries",
+                "gridPos": {
+                  "x": 0,
+                  "y": 9,
+                  "w": 12,
+                  "h": 9
+                },
+                "datasource": {
+                  "type": "prometheus",
+                  "uid": "ops-prometheus"
+                },
+                "fieldConfig": {
+                  "defaults": {
+                    "unit": "percent"
+                  },
+                  "overrides": []
+                },
+                "targets": [
+                  {
+                    "refId": "A",
+                    "expr": "100 * (1 - node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)",
+                    "legendFormat": "{% raw %}{{node}}{% endraw %}",
+                    "datasource": {
+                      "type": "prometheus",
+                      "uid": "ops-prometheus"
+                    }
+                  }
+                ]
+              },
+              {
+                "id": 4,
+                "title": "根分区使用率",
+                "type": "timeseries",
+                "gridPos": {
+                  "x": 12,
+                  "y": 9,
+                  "w": 12,
+                  "h": 9
+                },
+                "datasource": {
+                  "type": "prometheus",
+                  "uid": "ops-prometheus"
+                },
+                "fieldConfig": {
+                  "defaults": {
+                    "unit": "percent"
+                  },
+                  "overrides": []
+                },
+                "targets": [
+                  {
+                    "refId": "A",
+                    "expr": "100 * (1 - node_filesystem_avail_bytes{mountpoint=\"/\"} / node_filesystem_size_bytes{mountpoint=\"/\"})",
+                    "legendFormat": "{% raw %}{{node}}{% endraw %}",
+                    "datasource": {
+                      "type": "prometheus",
+                      "uid": "ops-prometheus"
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+
+    - name: 启动 Grafana
+      ansible.builtin.systemd:
+        name: grafana-server
+        state: started
+        enabled: true
+        daemon_reload: true
+
+    - name: 立即应用 Grafana 配置
+      ansible.builtin.meta: flush_handlers
+
+    - name: 在实验网卡上放行 Grafana 的运行时与永久规则
+      ansible.builtin.shell: |
+        zone=$(firewall-cmd --get-zone-of-interface=ens192) || zone=
+        if [ -z "$zone" ] || [ "$zone" = "no zone" ]; then
+          zone=$(firewall-cmd --get-default-zone) || exit
+        fi
+        if firewall-cmd --zone="$zone" --query-rich-rule "$GRAFANA_RULE" {{ item }}; then
+          exit 0
+        else
+          rc=$?
+          [ "$rc" -eq 1 ] || exit "$rc"
+        fi
+        firewall-cmd --zone="$zone" --add-rich-rule "$GRAFANA_RULE" {{ item }} || exit
+        echo rule-added
+      environment:
+        GRAFANA_RULE: "{{ grafana_rule }}"
+      loop: ['', '--permanent']
+      register: grafana_firewall
+      changed_when: "'rule-added' in grafana_firewall.stdout"
+
+    - name: 从控制节点验证 Grafana 健康接口
+      become: false
+      delegate_to: localhost
+      ansible.builtin.uri:
+        url: http://192.168.175.13:3000/api/health
+        use_proxy: false
+        status_code: 200
+      register: grafana_health
+      until: (grafana_health.json | default({})).get('database') == 'ok'
+      retries: 12
+      delay: 3
+
+  handlers:
+    - name: 重启 Grafana
+      ansible.builtin.systemd:
+        name: grafana-server
+        state: restarted
+        daemon_reload: true

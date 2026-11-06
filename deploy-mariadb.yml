@@ -1,0 +1,82 @@
+---
+- name: 部署 MariaDB 实验数据库
+  hosts: db-server
+  gather_facts: false
+  vars:
+    mariadb_socket_cli: [mariadb, --protocol=socket, --batch, --skip-column-names]
+
+  tasks:
+    - name: 安装 MariaDB 服务端
+      become: true
+      ansible.builtin.dnf:
+        name: mariadb-server
+        state: present
+
+    - name: 配置 MariaDB 仅监听本机地址
+      become: true
+      ansible.builtin.copy:
+        dest: /etc/my.cnf.d/zz-ops-lab.cnf
+        owner: root
+        group: root
+        mode: '0644'
+        content: |
+          [mysqld]
+          bind-address=127.0.0.1
+      notify: 重启 MariaDB
+
+    - name: 确保 MariaDB 启动并开机自启
+      become: true
+      ansible.builtin.systemd:
+        name: mariadb
+        state: started
+        enabled: true
+
+    - name: 在数据库初始化之前应用配置
+      ansible.builtin.meta: flush_handlers
+
+    - name: 初始化实验库和只读账号
+      become: true
+      ansible.builtin.command:
+        argv: "{{ mariadb_socket_cli + ['--user=root'] }}"
+        stdin: |
+          SET @needs_setup = NOT EXISTS (
+            SELECT 1 FROM information_schema.TABLES
+            WHERE TABLE_SCHEMA = 'ops_lab' AND TABLE_NAME = 'assets'
+          ) OR NOT EXISTS (
+            SELECT 1 FROM information_schema.SCHEMA_PRIVILEGES
+            WHERE GRANTEE = CONCAT(QUOTE('ops'), '@', QUOTE('localhost'))
+              AND TABLE_SCHEMA = 'ops_lab' AND PRIVILEGE_TYPE = 'SELECT'
+          );
+          CREATE DATABASE IF NOT EXISTS ops_lab CHARACTER SET utf8mb4;
+          CREATE TABLE IF NOT EXISTS ops_lab.assets (
+            id INT PRIMARY KEY,
+            hostname VARCHAR(64) NOT NULL
+          );
+          INSERT INTO ops_lab.assets (id, hostname)
+          VALUES (1, 'web-server'), (2, 'db-server'), (3, 'monitor-server')
+          ON DUPLICATE KEY UPDATE hostname = VALUES(hostname);
+          SET @fixture_changed = ROW_COUNT() > 0;
+          CREATE USER IF NOT EXISTS 'ops'@'localhost' IDENTIFIED VIA unix_socket;
+          GRANT SELECT ON ops_lab.* TO 'ops'@'localhost';
+          SELECT @needs_setup OR @fixture_changed;
+      register: database_setup
+      changed_when: database_setup.stdout_lines[-1] == '1'
+
+    - name: 用只读账号查询样例数据
+      ansible.builtin.command:
+        argv: "{{ mariadb_socket_cli + ['--user=ops', '--database=ops_lab'] }}"
+        stdin: SELECT hostname FROM assets WHERE id IN (1, 2, 3) ORDER BY id;
+      register: sample_query
+      changed_when: false
+      failed_when: sample_query.rc != 0 or sample_query.stdout_lines != ['web-server', 'db-server', 'monitor-server']
+
+    - name: 显示查询结果
+      ansible.builtin.debug:
+        var: sample_query.stdout_lines
+
+  handlers:
+    - name: 重启 MariaDB
+      become: true
+      ansible.builtin.systemd:
+        name: mariadb
+        state: restarted

@@ -1,0 +1,126 @@
+---
+- name: 部署 Prometheus 并采集本机指标
+  hosts: monitor-server
+  gather_facts: false
+  become: true
+
+  tasks:
+    - name: 安装 EPEL 仓库定义和签名公钥
+      ansible.builtin.dnf:
+        name: epel-release
+        state: present
+        disablerepo: epel
+
+    - name: 添加可按需使用的 EPEL 国内镜像
+      ansible.builtin.yum_repository:
+        name: ops-lab-epel
+        description: EPEL 9 mirror for the operations lab
+        baseurl: https://mirrors.aliyun.com/epel/9/Everything/x86_64/
+        enabled: false
+        gpgcheck: true
+        gpgkey: file:///etc/pki/rpm-gpg/RPM-GPG-KEY-EPEL-9
+
+    - name: 安装 Prometheus 和 promtool
+      ansible.builtin.dnf:
+        name: prometheus
+        state: present
+        enablerepo: ops-lab-epel
+        disablerepo: epel
+
+    - name: 配置节点离线告警
+      ansible.builtin.copy:
+        dest: /etc/prometheus/ops-lab-alerts.yml
+        owner: root
+        group: prometheus
+        mode: '0640'
+        validate: /usr/bin/promtool check rules %s
+        content: |
+          groups:
+            - name: ops-lab
+              interval: 15s
+              rules:
+                - alert: LinuxNodeDown
+                  expr: up{job="linux"} == 0
+                  for: 30s
+                  labels:
+                    severity: warning
+                  annotations:
+                    summary: 'Node Exporter 无法采集'
+      notify: 重启 Prometheus
+
+    - name: 写入并校验采集配置
+      ansible.builtin.copy:
+        dest: /etc/prometheus/ops-lab.yml
+        owner: root
+        group: prometheus
+        mode: '0640'
+        validate: /usr/bin/promtool check config %s
+        content: |
+          global:
+            scrape_interval: 15s
+            scrape_timeout: 5s
+          rule_files:
+            - /etc/prometheus/ops-lab-alerts.yml
+          scrape_configs:
+            - job_name: linux
+              static_configs:
+                - targets: ['127.0.0.1:9100']
+                  labels:
+                    node: monitor-server
+                - targets: ['192.168.175.10:9100']
+                  labels:
+                    node: ops-server
+                - targets: ['192.168.175.11:9100']
+                  labels:
+                    node: web-server
+                - targets: ['192.168.175.12:9100']
+                  labels:
+                    node: db-server
+      notify: 重启 Prometheus
+
+    - name: 创建 systemd 覆盖配置目录
+      ansible.builtin.file:
+        path: /etc/systemd/system/prometheus.service.d
+        state: directory
+        mode: '0755'
+
+    - name: 指定采集配置并让查询接口只监听本机
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/prometheus.service.d/ops-lab.conf
+        mode: '0644'
+        content: |
+          [Service]
+          StateDirectory=prometheus
+          ExecStart=
+          ExecStart=/usr/bin/prometheus --config.file=/etc/prometheus/ops-lab.yml --storage.tsdb.path=/var/lib/prometheus --storage.tsdb.retention.time=3d --web.listen-address=127.0.0.1:9090
+      notify: 重启 Prometheus
+
+    - name: 启动 Prometheus 并设置开机自启
+      ansible.builtin.systemd:
+        name: prometheus
+        daemon_reload: true
+        state: started
+        enabled: true
+
+    - name: 确保新配置已生效
+      ansible.builtin.meta: flush_handlers
+
+    - name: 等待 Prometheus 采集到四台节点的指标
+      become: false
+      ansible.builtin.uri:
+        url: 'http://127.0.0.1:9090/api/v1/query?query=up'
+        use_proxy: false
+        status_code: 200
+      register: scrape
+      until: >-
+        (scrape.json | default({})).get('data', {}).get('result', [])
+        | selectattr('value.1', 'equalto', '1') | list | length == 4
+      retries: 10
+      delay: 3
+
+  handlers:
+    - name: 重启 Prometheus
+      ansible.builtin.systemd:
+        name: prometheus
+        daemon_reload: true
+        state: restarted

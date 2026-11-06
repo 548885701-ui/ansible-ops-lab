@@ -1,0 +1,81 @@
+---
+- name: 配置 Web 和 MariaDB 的定时备份
+  hosts: 'web-server:db-server'
+  gather_facts: false
+  become: true
+  vars:
+    backup_dir: /var/backups/ops-lab
+    backup_prefix: "{{ 'mariadb-ops_lab' if inventory_hostname == 'db-server' else 'nginx-site' }}"
+    backup_extension: "{{ 'sql.gz' if inventory_hostname == 'db-server' else 'tar.gz' }}"
+
+  tasks:
+    - name: 创建仅 root 可访问的备份目录
+      ansible.builtin.file:
+        path: "{{ backup_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: '0700'
+
+    - name: 写入备份脚本
+      ansible.builtin.copy:
+        dest: /usr/local/sbin/ops-lab-backup
+        owner: root
+        group: root
+        mode: '0750'
+        validate: /usr/bin/bash -n %s
+        content: |
+          #!/usr/bin/bash
+          set -euo pipefail
+          umask 077
+          backup_dir={{ backup_dir }}
+          stamp=$(date -u +%Y%m%dT%H%M%S%NZ)
+          destination="$backup_dir/{{ backup_prefix }}-$stamp.{{ backup_extension }}"
+          tmp=$(mktemp "$backup_dir/.backup.XXXXXX")
+          trap 'rm -f -- "$tmp"' EXIT
+          {% if inventory_hostname == 'db-server' %}
+          mariadb-dump --protocol=socket --user=root --single-transaction --quick ops_lab | gzip -c > "$tmp"
+          gzip -t "$tmp"
+          {% else %}
+          tar -czf "$tmp" -C / etc/nginx usr/share/nginx/html/ansible-lab.html
+          tar -tzf "$tmp" >/dev/null
+          {% endif %}
+          mv -- "$tmp" "$destination"
+          printf '%s\n' "$destination"
+          find "$backup_dir" -maxdepth 1 -type f -name '{{ backup_prefix }}-*.{{ backup_extension }}' -mtime +7 -delete
+
+    - name: 写入 systemd 一次性服务
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/ops-lab-backup.service
+        mode: '0644'
+        content: |
+          [Unit]
+          Description=Operations lab backup
+
+          [Service]
+          Type=oneshot
+          UMask=0077
+          ExecStart=/usr/local/sbin/ops-lab-backup
+
+    - name: 写入每日 03 点 15 分运行的定时器
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/ops-lab-backup.timer
+        mode: '0644'
+        content: |
+          [Unit]
+          Description=Daily operations lab backup
+
+          [Timer]
+          OnCalendar=*-*-* 03:15:00 Asia/Shanghai
+          Persistent=true
+
+          [Install]
+          WantedBy=timers.target
+      register: backup_timer
+
+    - name: 启用定时器
+      ansible.builtin.systemd:
+        name: ops-lab-backup.timer
+        daemon_reload: true
+        enabled: true
+        state: "{{ 'restarted' if backup_timer.changed else 'started' }}"

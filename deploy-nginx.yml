@@ -1,0 +1,23 @@
+---
+- name: 部署 Nginx
+  hosts: web-server
+  gather_facts: false
+
+  tasks:
+    - name: 安装 Nginx
+      become: true
+      ansible.builtin.dnf:
+        name: nginx
+        state: present
+
+    - name: 启动 Nginx 并设置开机自启
+      become: true
+      ansible.builtin.systemd:
+        name: nginx
+        state: started
+        enabled: true
+
+    - name: 验证 Web 节点本机返回 HTTP 200
+      ansible.builtin.uri:
+        url: http://127.0.0.1/
+        status_code: 200

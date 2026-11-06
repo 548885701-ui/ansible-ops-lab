@@ -1,0 +1,109 @@
+---
+- name: 实测 Web 和数据库备份
+  hosts: 'web-server:db-server'
+  gather_facts: false
+  become: true
+
+  tasks:
+    - name: 手动触发一次与定时器相同的备份服务
+      ansible.builtin.systemd:
+        name: ops-lab-backup.service
+        state: started
+
+    - name: 核对 Web 备份包含 Nginx 配置且页面可完整提取
+      when: inventory_hostname == 'web-server'
+      ansible.builtin.shell: |
+        set -euo pipefail
+        shopt -s nullglob
+        archives=(/var/backups/ops-lab/nginx-site-*.tar.gz)
+        backup=${archives[-1]}
+        contents=$(tar -tzf "$backup")
+        grep -Fxq etc/nginx/nginx.conf <<< "$contents"
+        tar -xOzf "$backup" usr/share/nginx/html/ansible-lab.html |
+          cmp - /usr/share/nginx/html/ansible-lab.html
+        printf '备份: %s\nNginx 配置在归档内，页面提取后与原文件一致。\n' "$backup"
+      args:
+        executable: /bin/bash
+      register: web_backup_verify
+      changed_when: false
+
+    - name: 将数据库备份还原到独立测试库并核对记录
+      when: inventory_hostname == 'db-server'
+      ansible.builtin.shell: |
+        set -euo pipefail
+        shopt -s nullglob
+        archives=(/var/backups/ops-lab/mariadb-ops_lab-*.sql.gz)
+        backup=${archives[-1]}
+        gzip -t "$backup"
+        read -r uuid < /proc/sys/kernel/random/uuid
+        restore_db="ops_lab_restore_${uuid//-/}"
+        client=(mariadb --protocol=socket --user=root --batch --skip-column-names)
+        "${client[@]}" --execute="CREATE DATABASE $restore_db CHARACTER SET utf8mb4"
+        trap '"${client[@]}" --execute="DROP DATABASE $restore_db"' EXIT
+        gzip -dc "$backup" | "${client[@]}" --database="$restore_db"
+        query='SELECT id, hostname FROM assets ORDER BY id;'
+        original=$("${client[@]}" --database=ops_lab --execute="$query")
+        restored=$("${client[@]}" --database="$restore_db" --execute="$query")
+        test "$restored" = "$original"
+        test "$(wc -l <<< "$restored")" -eq 3
+        "${client[@]}" --execute="DROP DATABASE $restore_db"
+        trap - EXIT
+        printf '备份: %s\n恢复后记录与原库一致:\n%s\n' "$backup" "$restored"
+      args:
+        executable: /bin/bash
+      register: db_backup_verify
+      changed_when: true
+
+    - name: 输出备份验证证据
+      ansible.builtin.debug:
+        var: "{{ 'web_backup_verify.stdout_lines' if inventory_hostname == 'web-server' else 'db_backup_verify.stdout_lines' }}"
+
+- name: 核对 Grafana 已加载仪表盘并能查询 Prometheus
+  hosts: monitor-server
+  gather_facts: false
+  vars:
+    grafana_base: http://192.168.175.13:3000
+
+  tasks:
+    - name: 读取 root 专用的 Grafana 初始管理员凭据
+      become: true
+      ansible.builtin.slurp:
+        src: /etc/grafana/ops-lab-admin.env
+      register: grafana_secret
+      no_log: true
+
+    - name: 请求预置仪表盘
+      ansible.builtin.uri:
+        url: "{{ grafana_base }}/api/dashboards/uid/ops-linux-lab"
+        url_username: admin
+        url_password: "{{ (grafana_secret.content | b64decode | trim).split('=', 1)[1] }}"
+        force_basic_auth: true
+        use_proxy: false
+        status_code: 200
+      register: grafana_dashboard
+      no_log: true
+
+    - name: 通过 Grafana 数据源代理查询四台节点在线状态
+      ansible.builtin.uri:
+        url: "{{ grafana_base }}/api/datasources/proxy/uid/ops-prometheus/api/v1/query?query=up%7Bjob%3D%22linux%22%7D"
+        url_username: admin
+        url_password: "{{ (grafana_secret.content | b64decode | trim).split('=', 1)[1] }}"
+        force_basic_auth: true
+        use_proxy: false
+        status_code: 200
+      register: grafana_query
+      failed_when: false
+      no_log: true
+
+    - name: 报告 Grafana 数据源 HTTP 状态
+      ansible.builtin.debug:
+        msg: "Grafana HTTP {{ grafana_query.status | default('未知') }}，{{ (grafana_query.json | default({})).get('message', '') }}"
+
+    - name: 确认四个面板和四台节点的在线状态
+      ansible.builtin.assert:
+        that:
+          - grafana_dashboard.json.dashboard.panels | length == 4
+          - grafana_query.status == 200
+          - grafana_query.json.data.result | length == 4
+          - grafana_query.json.data.result | selectattr('value.1', 'equalto', '1') | list | length == 4
+        success_msg: Grafana 已加载四个面板，数据源查询返回四台节点在线。

@@ -1,0 +1,136 @@
+---
+- name: 演练 Web 故障和节点采集告警
+  hosts: web-server
+  gather_facts: false
+  vars:
+    web_demo: http://192.168.175.11/ansible-lab.html
+    alerts_api: http://127.0.0.1:9090/api/v1/alerts
+
+  tasks:
+    - name: 演练前确认网页可达
+      delegate_to: localhost
+      ansible.builtin.uri:
+        url: "{{ web_demo }}"
+        status_code: 200
+        use_proxy: false
+
+    - name: 演练前确认两个服务都在运行
+      ansible.builtin.command: "systemctl is-active {{ item }}"
+      loop: [nginx, node_exporter]
+      changed_when: false
+
+    - name: 设置三分钟后的自动恢复兜底
+      become: true
+      ansible.builtin.command:
+        argv:
+          - systemd-run
+          - --unit=ops-lab-drill-recovery
+          - --on-active=180s
+          - /usr/bin/systemctl
+          - start
+          - nginx
+          - node_exporter
+
+    - name: 模拟故障并保证恢复
+      block:
+        - name: 暂停实验 Web 服务和指标采集器
+          become: true
+          ansible.builtin.systemd:
+            name: "{{ item }}"
+            state: stopped
+          loop: [nginx, node_exporter]
+
+        - name: 从控制节点确认网页连接失败
+          delegate_to: localhost
+          ansible.builtin.uri:
+            url: "{{ web_demo }}"
+            use_proxy: false
+            timeout: 4
+          register: outage_http
+          failed_when: outage_http.status != -1
+
+        - name: 等待 Prometheus 告警进入 firing
+          delegate_to: monitor-server
+          ansible.builtin.uri:
+            url: "{{ alerts_api }}"
+            status_code: 200
+            use_proxy: false
+          register: outage_alerts
+          until: >-
+            (outage_alerts.json | default({})).get('data', {}).get('alerts', [])
+            | selectattr('labels.alertname', 'equalto', 'LinuxNodeDown')
+            | selectattr('labels.node', 'equalto', 'web-server')
+            | selectattr('state', 'equalto', 'firing') | list | length == 1
+          retries: 18
+          delay: 4
+
+        - name: 输出故障与告警证据
+          ansible.builtin.debug:
+            msg: 网页连接失败，Prometheus 的 LinuxNodeDown 已对 web-server 进入 firing。
+
+      always:
+        - name: 恢复 Nginx 和 Node Exporter
+          become: true
+          ansible.builtin.systemd:
+            name: "{{ item }}"
+            state: started
+          loop: [nginx, node_exporter]
+
+        - name: 从控制节点确认网页恢复 HTTP 200
+          delegate_to: localhost
+          ansible.builtin.uri:
+            url: "{{ web_demo }}"
+            status_code: 200
+            use_proxy: false
+          register: web_recovery
+          until: web_recovery.status == 200
+          retries: 5
+          delay: 2
+
+        - name: 确认 Prometheus 已重新采集到 Web 节点
+          delegate_to: monitor-server
+          ansible.builtin.uri:
+            url: 'http://127.0.0.1:9090/api/v1/query?query=up%7Bnode%3D%22web-server%22%7D'
+            use_proxy: false
+            status_code: 200
+          register: node_recovery
+          until: >-
+            (node_recovery.json | default({})).get('data', {}).get('result', [])
+            | selectattr('value.1', 'equalto', '1') | list | length == 1
+          retries: 10
+          delay: 3
+
+        - name: 确认 Web 节点的离线告警已经清除
+          delegate_to: monitor-server
+          ansible.builtin.uri:
+            url: "{{ alerts_api }}"
+            use_proxy: false
+            status_code: 200
+          register: cleared_alerts
+          until: >-
+            (cleared_alerts.json | default({})).get('data', {}).get('alerts', [])
+            | selectattr('labels.alertname', 'equalto', 'LinuxNodeDown')
+            | selectattr('labels.node', 'equalto', 'web-server') | list | length == 0
+          retries: 10
+          delay: 3
+
+        - name: 停止兜底定时器
+          become: true
+          ansible.builtin.systemd:
+            name: ops-lab-drill-recovery.timer
+            state: stopped
+
+    - name: 核对访问日志服务日志和日志轮转配置
+      become: true
+      ansible.builtin.shell: |
+        set -eu
+        grep ' /ansible-lab.html ' /var/log/nginx/access.log | tail -n 1
+        journalctl -u nginx -n 6 --no-pager
+        test -s /etc/logrotate.d/nginx
+        logrotate -d /etc/logrotate.conf 2>&1 | grep -m1 '/var/log/nginx/'
+      register: nginx_evidence
+      changed_when: false
+
+    - name: 输出恢复和日志证据
+      ansible.builtin.debug:
+        var: nginx_evidence.stdout_lines

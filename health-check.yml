@@ -1,0 +1,21 @@
+---
+- name: 巡检三台服务器
+  hosts: managed
+  gather_facts: false
+
+  tasks:
+    - name: 执行只读巡检命令
+      ansible.builtin.command: "{{ item }}"
+      loop:
+        - hostname
+        - uptime
+        - df -h /
+      register: health_check
+      changed_when: false
+
+    - name: 显示巡检结果
+      ansible.builtin.debug:
+        msg: "{{ item.stdout_lines }}"
+      loop: "{{ health_check.results }}"
+      loop_control:
+        label: "{{ item.item }}"

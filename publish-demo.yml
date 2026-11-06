@@ -1,0 +1,70 @@
+---
+- name: 发布运维演示页面
+  hosts: web-server
+  gather_facts: false
+  vars:
+    lab_http_rule: 'rule family="ipv4" source address="192.168.175.0/24" service name="http" accept'
+    firewall_scopes:
+      - []
+      - [--permanent]
+
+  tasks:
+    - name: 发布独立的演示页面
+      become: true
+      ansible.builtin.copy:
+        dest: /usr/share/nginx/html/ansible-lab.html
+        owner: root
+        group: root
+        mode: '0644'
+        content: |
+          <!doctype html>
+          <html lang="zh-CN">
+          <head>
+            <meta charset="utf-8">
+            <title>Ansible 运维实验</title>
+          </head>
+          <body>
+            <h1>Ansible 运维实验</h1>
+            <p>该页面由 ops-server 使用 Ansible 部署到 web-server。</p>
+          </body>
+          </html>
+
+    - name: 识别实验网卡所属的防火墙区域
+      become: true
+      ansible.builtin.shell: |
+        zone=$(firewall-cmd --get-zone-of-interface=ens192) || zone=
+        if [ -n "$zone" ] && [ "$zone" != "no zone" ]; then
+          printf '%s\n' "$zone"
+        else
+          firewall-cmd --get-default-zone
+        fi
+      register: lab_zone
+      changed_when: false
+
+    - name: 检查 HTTP 规则是否已存在
+      become: true
+      ansible.builtin.command:
+        argv: "{{ ['firewall-cmd', '--zone=' ~ lab_zone.stdout, '--query-rich-rule', lab_http_rule] + item }}"
+      loop: "{{ firewall_scopes }}"
+      register: http_rule_checks
+      changed_when: false
+      failed_when: http_rule_checks.rc not in [0, 1]
+
+    - name: 补齐运行时和永久防火墙规则
+      become: true
+      ansible.builtin.command:
+        argv: "{{ ['firewall-cmd', '--zone=' ~ lab_zone.stdout, '--add-rich-rule', lab_http_rule] + item.item }}"
+      loop: "{{ http_rule_checks.results }}"
+      loop_control:
+        label: "{{ item.item | join(' ') or '运行时' }}"
+      when: item.rc == 1
+
+    - name: 从控制节点验证演示页面
+      delegate_to: localhost
+      ansible.builtin.uri:
+        url: "http://{{ hostvars[inventory_hostname].ansible_host }}/ansible-lab.html"
+        use_proxy: false
+        status_code: 200
+        return_content: true
+      register: demo_http
+      failed_when: demo_http.status != 200 or 'Ansible 运维实验' not in (demo_http.content | default(''))

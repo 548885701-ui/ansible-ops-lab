@@ -1,0 +1,7 @@
+.cache/
+*.log
+*.retry
+*.env
+*.pem
+*.key
+id_ed25519*

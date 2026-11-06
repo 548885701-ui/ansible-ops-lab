@@ -1,0 +1,69 @@
+---
+- name: 从监控节点获取已校验的安装包
+  hosts: monitor-server
+  gather_facts: false
+  tasks:
+    - name: 准备控制节点的安装包缓存目录
+      delegate_to: localhost
+      ansible.builtin.file:
+        path: "{{ playbook_dir }}/.cache"
+        state: directory
+        mode: '0700'
+
+    - name: 获取 Node Exporter 压缩包
+      ansible.builtin.fetch:
+        src: /var/cache/node_exporter-1.12.1.linux-amd64.tar.gz
+        dest: "{{ playbook_dir }}/.cache/"
+        flat: true
+        validate_checksum: true
+
+- ansible.builtin.import_playbook: deploy-node-exporter.yml
+  vars:
+    exporter_hosts: 'web-server:db-server:ops-server'
+    exporter_use_cache: true
+
+- name: 允许监控节点采集实验内网指标
+  hosts: 'web-server:db-server:ops-server'
+  gather_facts: false
+  become: true
+  vars:
+    exporter_rule: 'rule family="ipv4" source address="192.168.175.13/32" port port="9100" protocol="tcp" accept'
+    firewall_scopes:
+      - []
+      - [--permanent]
+
+  tasks:
+    - name: 查找实验网卡的防火墙区域
+      ansible.builtin.shell: |
+        zone=$(firewall-cmd --get-zone-of-interface=ens192) || zone=
+        if [ -n "$zone" ] && [ "$zone" != "no zone" ]; then
+          echo "$zone"
+        else
+          firewall-cmd --get-default-zone
+        fi
+      register: exporter_zone
+      changed_when: false
+
+    - name: 检查运行时和永久规则
+      ansible.builtin.command:
+        argv: "{{ ['firewall-cmd', '--zone=' ~ exporter_zone.stdout, '--query-rich-rule', exporter_rule] + item }}"
+      loop: "{{ firewall_scopes }}"
+      register: exporter_firewall
+      changed_when: false
+      failed_when: exporter_firewall.rc not in [0, 1]
+
+    - name: 补齐只允许监控节点访问 TCP 9100 的规则
+      ansible.builtin.command:
+        argv: "{{ ['firewall-cmd', '--zone=' ~ exporter_zone.stdout, '--add-rich-rule', exporter_rule] + item.item }}"
+      loop: "{{ exporter_firewall.results }}"
+      loop_control:
+        label: "{{ item.item | join(' ') or '运行时' }}"
+      when: item.rc == 1
+
+    - name: 从监控节点访问各目标的 9100
+      become: false
+      delegate_to: monitor-server
+      ansible.builtin.uri:
+        url: "http://{{ hostvars[inventory_hostname].ansible_host }}:9100/metrics"
+        use_proxy: false
+        status_code: 200

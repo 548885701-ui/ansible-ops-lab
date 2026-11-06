@@ -1,0 +1,10 @@
+---
+- ansible.builtin.import_playbook: health-check.yml
+- ansible.builtin.import_playbook: deploy-nginx.yml
+- ansible.builtin.import_playbook: publish-demo.yml
+- ansible.builtin.import_playbook: deploy-mariadb.yml
+- ansible.builtin.import_playbook: deploy-node-exporter.yml
+- ansible.builtin.import_playbook: expand-node-exporters.yml
+- ansible.builtin.import_playbook: deploy-prometheus.yml
+- ansible.builtin.import_playbook: deploy-grafana.yml
+- ansible.builtin.import_playbook: deploy-backups.yml
